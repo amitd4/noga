@@ -1,4 +1,5 @@
 import argparse
+import math
 import re
 import textwrap
 import time
@@ -14,6 +15,25 @@ from typing import List, Optional, Tuple
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ATOM_NAMESPACE = {"atom": "http://www.w3.org/2005/Atom"}
 REQUEST_HEADERS = {"User-Agent": "noga-paper-search-agent/0.1"}
+STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "using",
+    "with",
+}
 
 
 @dataclass
@@ -24,20 +44,21 @@ class Paper:
     published: str
     link: str
     pdf_link: Optional[str]
+    relevance_note: Optional[str] = None
 
 
 class PaperSearchAgent:
     def __init__(self, max_results: int = 5):
         self.max_results = max_results
 
-    def search(self, topic: str) -> List[Paper]:
+    def search(self, topic: str, max_results: Optional[int] = None) -> List[Paper]:
         if not topic.strip():
             raise ValueError("Please provide a non-empty topic.")
 
         params = {
             "search_query": f"all:{topic}",
             "start": 0,
-            "max_results": self.max_results,
+            "max_results": max_results or self.max_results,
             "sortBy": "relevance",
             "sortOrder": "descending",
         }
@@ -68,6 +89,8 @@ class PaperSearchAgent:
                 failed_downloads.append(f"{paper.title} (HTTP {error.code})")
             except urllib.error.URLError as error:
                 failed_downloads.append(f"{paper.title} ({error.reason})")
+            except OSError as error:
+                failed_downloads.append(f"{paper.title} ({error})")
 
         return saved_files, failed_downloads
 
@@ -137,6 +160,105 @@ class PaperSearchAgent:
         return f"{index:02d}_{title}.pdf"
 
 
+class HybridSearchRanker:
+    def __init__(self):
+        self.bm25_cls = self._load_bm25()
+
+    def _recency_bonus(self, published: str) -> float:
+        match = re.match(r"(\d{4})", published)
+        if not match:
+            return 0.0
+
+        year = int(match.group(1))
+        if year < 2020:
+            return 0.0
+
+        return min(2.0, math.log1p(year - 2019))
+
+    def rank(self, topic: str, papers: List[Paper], limit: int) -> List[Paper]:
+        if not papers:
+            return []
+
+        documents = [self._paper_text(paper) for paper in papers]
+        tokenized_documents = [self._tokens(document) for document in documents]
+        topic_tokens = self._tokens(topic)
+
+        bm25_scores = self.bm25_cls(tokenized_documents).get_scores(topic_tokens)
+        tfidf_scores = self._tfidf_scores(topic, documents)
+        recency_scores = [self._recency_bonus(paper.published) for paper in papers]
+
+        bm25_scores = self._normalize(list(bm25_scores))
+        tfidf_scores = self._normalize(tfidf_scores)
+        recency_scores = self._normalize(recency_scores)
+
+        scored_papers = []
+        for index, paper in enumerate(papers):
+            score = (
+                bm25_scores[index] * 0.45
+                + tfidf_scores[index] * 0.45
+                + recency_scores[index] * 0.10
+            )
+            paper.relevance_note = (
+                f"hybrid score {score:.2f} "
+                f"(bm25 {bm25_scores[index]:.2f}, tf-idf {tfidf_scores[index]:.2f}, "
+                f"recency {recency_scores[index]:.2f})"
+            )
+            scored_papers.append((score, paper))
+
+        scored_papers.sort(key=lambda item: item[0], reverse=True)
+        return [paper for _, paper in scored_papers[:limit]]
+
+    def _paper_text(self, paper: Paper) -> str:
+        return f"{paper.title}. {paper.summary}"
+
+    def _tokens(self, text: str) -> List[str]:
+        words = re.findall(r"[A-Za-z0-9]+", text.lower())
+        return [word for word in words if len(word) > 2 and word not in STOP_WORDS]
+
+    def _tfidf_scores(self, topic: str, documents: List[str]) -> List[float]:
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError as error:
+            raise RuntimeError(
+                "Hybrid ranking dependencies are missing. Run: pip install -r requirements.txt"
+            ) from error
+
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            stop_words="english",
+            max_features=5000,
+        )
+        try:
+            matrix = vectorizer.fit_transform([topic] + documents)
+        except ValueError:
+            return [0.0 for _ in documents]
+
+        similarities = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
+        return [float(score) for score in similarities]
+
+    def _normalize(self, scores: List[float]) -> List[float]:
+        if not scores:
+            return []
+
+        low = min(scores)
+        high = max(scores)
+        if high == low:
+            return [0.0 for _ in scores]
+
+        return [(score - low) / (high - low) for score in scores]
+
+    def _load_bm25(self):
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError as error:
+            raise RuntimeError(
+                "Hybrid ranking dependencies are missing. Run: pip install -r requirements.txt"
+            ) from error
+
+        return BM25Okapi
+
+
 def format_paper(index: int, paper: Paper) -> str:
     authors = ", ".join(paper.authors[:4])
     if len(paper.authors) > 4:
@@ -152,6 +274,9 @@ def format_paper(index: int, paper: Paper) -> str:
 
     if paper.pdf_link:
         lines.append(f"   PDF: {paper.pdf_link}")
+
+    if paper.relevance_note:
+        lines.append(f"   Relevance note: {paper.relevance_note}")
 
     lines.extend(["   Summary:", textwrap.indent(summary, "     ")])
     return "\n".join(lines)
@@ -180,6 +305,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only print search results without downloading PDFs.",
     )
+    parser.add_argument(
+        "--no-rank",
+        action="store_true",
+        help="Use arXiv's original ordering without local reranking.",
+    )
+    parser.add_argument(
+        "--hybrid-rank",
+        action="store_true",
+        help="Use BM25 plus TF-IDF similarity. This is the default ranking mode.",
+    )
+    parser.add_argument(
+        "--candidate-pool",
+        type=positive_int,
+        default=10,
+        help="Number of arXiv candidates to fetch before local reranking. Default: 10.",
+    )
     return parser
 
 
@@ -200,10 +341,14 @@ def positive_int(value: str) -> int:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.no_rank and args.hybrid_rank:
+        print("Choose either --no-rank or --hybrid-rank, not both.")
+        return
+
     agent = PaperSearchAgent(max_results=args.max_results)
 
     try:
-        papers = agent.search(args.topic)
+        papers = search_and_rank(agent, args)
     except urllib.error.HTTPError as error:
         if error.code == 429:
             print("arXiv is rate-limiting requests right now. Please wait a minute and try again.")
@@ -212,6 +357,9 @@ def main() -> None:
         return
     except urllib.error.URLError as error:
         print(f"Search failed because the network request could not complete: {error.reason}")
+        return
+    except RuntimeError as error:
+        print(error)
         return
 
     if not papers:
@@ -240,6 +388,16 @@ def main() -> None:
         print("\nSome PDFs could not be downloaded:")
         for failed_download in failed_downloads:
             print(f"- {failed_download}")
+
+
+def search_and_rank(agent: PaperSearchAgent, args: argparse.Namespace) -> List[Paper]:
+    if args.no_rank:
+        return agent.search(args.topic)
+
+    candidate_count = max(args.candidate_pool, args.max_results)
+    candidates = agent.search(args.topic, max_results=candidate_count)
+
+    return HybridSearchRanker().rank(args.topic, candidates, args.max_results)
 
 
 if __name__ == "__main__":

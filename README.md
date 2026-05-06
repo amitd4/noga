@@ -20,7 +20,13 @@ Activate the virtual environment:
 .\.venv\Scripts\Activate.ps1
 ```
 
-Run the agent:
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Run the agent with the default hybrid ranker:
 
 ```bash
 python main.py "large language model agents"
@@ -44,6 +50,28 @@ Search without downloading:
 
 ```bash
 python main.py "graph neural networks" --no-download
+```
+
+## Ranking modes
+
+By default, the agent fetches a larger arXiv candidate pool and uses hybrid
+ranking: BM25 keyword ranking, TF-IDF cosine similarity, and a small recency
+bonus. This does not require any API key.
+
+```powershell
+python main.py "retrieval augmented generation for question answering" --max-results 3 --no-download
+```
+
+Change the candidate pool:
+
+```powershell
+python main.py "AI agents tool use" --candidate-pool 15 --max-results 5
+```
+
+Use raw arXiv ordering without local reranking:
+
+```powershell
+python main.py "AI agents tool use" --no-rank --max-results 5
 ```
 
 When you are done, deactivate the virtual environment:
