@@ -1,7 +1,7 @@
 [project]
 name = "noga"
 version = "0.1.0"
-description = "A small Python project"
+description = "A command-line agent for searching academic papers by topic"
 authors = [
   { name = "", email = "" }
 ]
