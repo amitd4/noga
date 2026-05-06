@@ -1,0 +1,13 @@
+[project]
+name = "noga"
+version = "0.1.0"
+description = "A small Python project"
+authors = [
+  { name = "", email = "" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.8"
+
+[tool.python.dependencies]
+# Add runtime dependencies here
